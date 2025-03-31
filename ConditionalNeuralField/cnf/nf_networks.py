@@ -225,83 +225,6 @@ class SIRENAutoencoder_film_extra_in(SIRENAutoencoder_film):
 # auto encoder: filter
 
 # siren auto decoder: FILM
-class SIRENAutodecoder_film_single(nn.Module):
-    '''
-    siren network with author decoding 
-    '''
-    def __init__(self, in_coord_features, out_features, num_hidden_layers, hidden_features,
-                 outermost_linear=False, nonlinearity='sine', weight_init=None,bias_init=None, #forward_mode = 'without_latent',
-                 premap_mode = None, **kwargs):
-        super().__init__()
-        self.premap_mode = premap_mode
-        if not self.premap_mode ==None: 
-            self.premap_layer = FeatureMapping(in_coord_features,mode = premap_mode, **kwargs)
-            in_coord_features = self.premap_layer.dim # update the nf in features     
-        # self.forward_mode = forward_mode # with_latent, without_latent
-        self.first_layer_init = None
-        
-                        
-        self.nl, nl_weight_init, first_layer_init = NLS_AND_INITS[nonlinearity]
-
-        if weight_init is not None:  # Overwrite weight init if passed
-            self.weight_init = weight_init
-        else:
-            self.weight_init = nl_weight_init # those are default init funcs 
-
-        self.net1 = nn.ModuleList([BatchLinear(in_coord_features,hidden_features)] + 
-                                  [BatchLinear(hidden_features,hidden_features) for i in range(num_hidden_layers)] + 
-                                  [BatchLinear(hidden_features,out_features)])
-
-        if self.weight_init is not None:
-            self.net1.apply(self.weight_init)
-
-        if first_layer_init is not None: # Apply special initialization to first layer, if applicable.
-            self.net1[0].apply(first_layer_init)
-
-
-    def forward(self, coords, all_latents=None):
-        # coords: <t,h,w,c_coord>
-        # latents: <t,h,w,c_latent>
-        
-        # premap 
-        if not self.premap_mode ==None: 
-            x = self.premap_layer(coords)
-        else: 
-            x = coords
-
-        if all_latents == None:
-            # pass it through  the nf network 
-            for i in range(len(self.net1) -1):
-                x = self.net1[i](x)
-                x = self.nl(x)
-            x = self.net1[-1](x)
-            return x 
-        else: 
-            # pass it through  the nf network 
-            for i in range(len(self.net1) -1):
-                x = self.net1[i](x) + all_latents[i]
-                x = self.nl(x)
-            x = self.net1[-1](x)
-            return x 
-
-    def forward_with_latent(self, coords, latents):
-        # coords: <t,h,w,c_coord>
-        # latents: <t,h,w,c_latent>
-        
-        # premap 
-        if not self.premap_mode ==None: 
-            x = self.premap_layer(coords)
-        else: 
-            x = coords
-
-        # pass it through  the nf network 
-        for i in range(len(self.net1) -1):
-            x = self.net1[i](x) + self.net2[i](latents)
-            x = self.nl(x)
-        x = self.net1[-1](x)
-        return x 
-
-# siren auto decoder: FILM
 class SIREN_rez_Autodecoder_film(nn.Module):
     '''
     siren network with author decoding 
@@ -763,7 +686,66 @@ class SIRENAutodecoder_fp(nn.Module):
         for param in self.parameters():
             param.requires_grad = False
             
-# siren auto decoder: modified FILM
+
+class SIRENAutodecoder_film(nn.Module):
+    '''
+    siren network with author decoding 
+    '''
+    def __init__(self, in_coord_features, in_latent_features, out_features, num_hidden_layers, hidden_features,
+                 outermost_linear=False, nonlinearity='sine', weight_init=None,bias_init=None,
+                 premap_mode = None,omega_0=30, **kwargs):
+        super().__init__()
+        self.premap_mode = premap_mode
+        if not self.premap_mode ==None: 
+            self.premap_layer = FeatureMapping(in_coord_features,mode = premap_mode, **kwargs)
+            in_coord_features = self.premap_layer.dim # update the nf in features     
+            print("applying feature mapping")
+
+                        
+        self.nl, nl_weight_init, first_layer_init = NLS_AND_INITS[nonlinearity]
+        if nonlinearity == 'sine':
+            self.nl.w0 = omega_0
+        self.weight_init = nl_weight_init
+
+        self.nf_net = nn.ModuleList([BatchLinear(in_coord_features,hidden_features)] + 
+                                  [BatchLinear(hidden_features,hidden_features) for i in range(num_hidden_layers)] + 
+                                  [BatchLinear(hidden_features,out_features)])
+        self.hb_net = nn.ModuleList([BatchLinear(in_latent_features,hidden_features,bias = False) for i in range(num_hidden_layers+1)])
+
+        if self.weight_init is not None:
+            print("applying weight init")
+            self.nf_net.apply(self.weight_init(omega_0))
+            self.hb_net.apply(self.weight_init(omega_0))
+
+        if first_layer_init is not None: # Apply special initialization to first layer, if applicable.
+            print("applying first layer init")
+            self.nf_net[0].apply(first_layer_init)
+            self.hb_net[0].apply(first_layer_init)
+
+        if bias_init is not None:
+            self.hb_net.apply(bias_init)
+
+    def forward(self, coords, latents):
+        # coords: <t,h,w,c_coord>
+        # latents: <t,h,w,c_latent>
+
+        # premap 
+        if not self.premap_mode ==None: 
+            x = self.premap_layer(coords)
+        else: 
+            x = coords
+        # pass it through  the nf network 
+        for i in range(len(self.nf_net) -1):
+            x = self.nf_net[i](x) + self.hb_net[i](latents)
+            x = self.nl(x)
+        x = self.nf_net[-1](x)
+        return x 
+
+
+    def disable_gradient(self):
+        for param in self.parameters():
+            param.requires_grad = False
+
 class SIRENAutodecoder_mdf_film(nn.Module):
     '''
     siren network with auto decoding 
@@ -771,21 +753,19 @@ class SIRENAutodecoder_mdf_film(nn.Module):
     '''
     def __init__(self, in_coord_features, in_latent_features, out_features, num_hidden_layers, hidden_features,
                  outermost_linear=False, nonlinearity='sine', weight_init=None,bias_init=None,
-                 premap_mode = None, **kwargs):
+                 premap_mode = None,dim=1,omega_0=30.0, **kwargs):
         super().__init__()
         self.premap_mode = premap_mode
         if not self.premap_mode ==None: 
             self.premap_layer = FeatureMapping(in_coord_features,mode = premap_mode, **kwargs)
             in_coord_features = self.premap_layer.dim # update the nf in features     
+            print("applying feature mapping")
 
-        self.first_layer_init = None
-                        
         self.nl, nl_weight_init, first_layer_init = NLS_AND_INITS[nonlinearity]
+        if nonlinearity == 'sine':
+            self.nl.w0 = omega_0
 
-        if weight_init is not None:  # Overwrite weight init if passed
-            self.weight_init = weight_init
-        else:
-            self.weight_init = nl_weight_init # those are default init funcs 
+        self.weight_init = nl_weight_init
 
         # create the net for the nf 
         self.nf_net = nn.ModuleList([BatchLinear(in_coord_features,hidden_features)] + 
@@ -798,49 +778,51 @@ class SIRENAutodecoder_mdf_film(nn.Module):
                                     # [BatchLinear(in_latent_features,hidden_features*out_features,bias = False)])
         self.hb_net = nn.ModuleList([BatchLinear(in_latent_features,hidden_features,bias = False) for i in range(num_hidden_layers+1)])
                                     #  [BatchLinear(in_latent_features,out_features*out_features,bias = False)])
+        self.dim = dim
 
         if self.weight_init is not None:
-            self.nf_net.apply(self.weight_init)
-
-        if first_layer_init is not None: # Apply special initialization to first layer, if applicable.
+            print("applying weight init")
+            self.nf_net.apply(self.weight_init(omega_0))
+            self.hw_net.apply(self.weight_init(omega_0))
+            self.hb_net.apply(self.weight_init(omega_0))
+        
+        if first_layer_init is not None:
+            print("applying first layer init")
             self.nf_net[0].apply(first_layer_init)
-        self.init_hyper_layer()     
-
-    def init_hyper_layer(self):
-        # init weights
-        self.hw_net.apply(init_weights_uniform_siren_scale)
-        self.hb_net.apply(init_weights_uniform_siren_scale)
+            self.hw_net[0].apply(first_layer_init)
+            self.hb_net[0].apply(first_layer_init)
 
     def forward(self, coords, latents):
         # _, h_size, w_size, coord_size = coords.shape
         t_size = latents.shape[0]
         # coords: <t,h,w,c_coord> or <1, h,w,c_coords>
         # latents: <t,h,w,c_latent> or <t, 1,1, coords>
-        
+
         # premap 
         if not self.premap_mode ==None: 
             x = self.premap_layer(coords)
         else: 
             x = coords
-
         # pass it through  the nf network 
         for i in range(len(self.nf_net) -1):
-
+            # print("x shape:", x.shape)
+            reshape_dims = (t_size,) + (1,) * self.dim + self.nf_net[i].weight.shape
             x = (
-                    self.nf_net[i](x) + 
-                    torch.einsum(
-                        'thwi,thwji->thwj', 
-                        x, 
-                        self.hw_net[i](latents).reshape((t_size, 1, 1)+self.nf_net[i].weight.shape)
-                    )
-                    + self.hb_net[i](latents)
+                self.nf_net[i](x) +
+                torch.einsum(
+                    '...i,...ji->...j',
+                    x,
+                    self.hw_net[i](latents).reshape(reshape_dims)
                 )
+                + self.hb_net[i](latents)
+            )
             
             x = self.nl(x)
 
         x = self.nf_net[-1](x)
 
         return x 
+
     
 
 class SIRENAutodecoder_mdf_film_extra_in(SIRENAutodecoder_mdf_film):

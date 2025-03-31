@@ -38,7 +38,7 @@ class Sine_tw(nn.Module):
 # different layers has different initialization schemes:
 NLS_AND_INITS = {
     # act name: (init func, first layer init func )
-    'sine':(Sine(), init.sine_init, init.first_layer_sine_init), 
+    'sine':(Sine(), init.sine_init_wrapper, init.first_layer_sine_init), 
     'relu':(nn.ReLU(inplace=True), init.init_weights_normal, None),
     'sigmoid':(nn.Sigmoid(), init.init_weights_xavier, None),
     'tanh':(nn.Tanh(), init.init_weights_xavier, None),

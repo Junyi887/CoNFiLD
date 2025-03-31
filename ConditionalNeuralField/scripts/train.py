@@ -18,7 +18,7 @@ from cnf.utils.normalize import Normalizer_ts
 from cnf.utils import readdata
 from cnf import nf_networks
 from functools import partial
-
+from cnf import visualize_tools
 
 class basic_set(Dataset):
     def __init__(self, fois, coord, extra_siren_in = None) -> None:
@@ -71,196 +71,295 @@ def rMAE(prediction, target, dims=(1, 2)):
 
 class trainer(object):
 
-    def __init__(self, hyper_para: ri.basic_input, infer_mode=False, infer_dps=False) -> None:
+    def __init__(self, hyper_para: ri.basic_input, tag: str, infer_dps=False):
         '''
         Initialize the training module for the Conditional Neural Field model.
-        For propogating gradient through the model (e.g. in DPS), set self.nf.eval() 
+        For propogating gradient through the model (e.g. in DPS), set self.nf.eval()
         Args:
             hyper_para (basic_input): The hyperparameters for the model.
-            infer_mode (bool, optional): Flag indicating whether the module is in inference mode. Defaults to False.
-                
         '''
+        self.hyper_para = hyper_para
+        self.logger_tag = tag
+        # Initialize basic attributes
+        self._init_paths(hyper_para)
+        
+        # Load and process data (if not in inference mode)
+        self._load_data(hyper_para)
+        
+        # Setup normalizers
+        self._setup_normalizers(hyper_para)
+        
+        # Initialize network and related components
+        self._init_network(hyper_para)
+        
+        # Configure inference mode if neede
+        
+        # Setup visualization and additional components
+        self._setup_visualization(hyper_para)
+        self._load_obstacle_mask(hyper_para)
+
+    def _init_paths(self, hyper_para):
+        '''Initialize basic attributes for the trainer.'''
         self.world_size = hyper_para.multiGPU
-
-        if not infer_mode:
-            ###### read data - fois ######
-            if hasattr(hyper_para, "load_data_fn"):
-                if type(hyper_para.load_data_fn) == str:
-                    load_data_fn = getattr(readdata, hyper_para.load_data_fn)
-                    load_params = {}
-                elif type(hyper_para.load_data_fn) == dict:
-                    load_data_fn = getattr(readdata, hyper_para.load_data_fn["name"])
-                    load_params = hyper_para.load_data_fn["kwargs"]
-                fois = load_data_fn(hyper_para.data_path, **load_params)
-
-            else:
-                fois = np.load(f"{hyper_para.data_path}")
-
-            assert (
-                rearrange(fois, f"{hyper_para.readin_data_shape} -> {hyper_para.readin_data_shape}")
-                == fois
-            ).all(), f"data shape is {tuple(fois.shape)}, which is inconsistant \
-            with the fois_shape ({hyper_para.readin_data_shape}) specified in yaml file."
-
-            fois = rearrange(
-                fois, f"{hyper_para.readin_data_shape} -> {hyper_para.batch_shape}"
-            )
-
-            if "kwargs" in hyper_para.NF:
-                assert (
-                    hyper_para.NF["kwargs"]["out_features"] == fois.shape[-1]
-                ), "NF_out_features is not consistent with fois shape"
-            else:
-                assert (
-                    hyper_para.NF["out_features"] == fois.shape[-1]
-                ), "NF_out_features is not consistent with fois shape"
+        if hasattr(hyper_para, "loading_path"):
+            self.loading_path = hyper_para.loading_path
+        else:
+            self.loading_path = hyper_para.save_path
             
-            if hasattr(hyper_para, "extra_siren_in"):
-                assert isinstance(hyper_para.extra_siren_in, int) or len(hyper_para.extra_siren_in) >= 3
-                if isinstance(hyper_para.extra_siren_in, int):
-                    extra_siren_in = torch.linspace(0,1,hyper_para.extra_siren_in)
-                elif len(hyper_para.extra_siren_in) == 3:
-                    extra_siren_in = torch.linspace(*hyper_para.extra_siren_in)
-                elif len(hyper_para.extra_siren_in) > 3:
-                    extra_siren_in = torch.tensor(hyper_para.extra_siren_in)
-                extra_siren_in_flag = True
-            else:
-                extra_siren_in_flag = False
+        if not exists(f"{hyper_para.save_path}"):
+            mkdir(hyper_para.save_path)
 
-            self.spatio_shape = fois.shape[1:-1]
-            self.spatio_axis = list(
-                range(fois.ndim if isinstance(fois, np.ndarray) else fois.dim())
-            )[1:-1]
-            if extra_siren_in_flag: 
-                self.spatio_shape = self.spatio_shape[1:]
-                self.spatio_axis = self.spatio_axis[:-1]
-                
-            ###### read data - coordinate ######
-            if hasattr(hyper_para, "coor_path"):
-                coord = np.load(f"{hyper_para.coor_path}")
-                assert (
-                    coord.shape[:-1] == self.spatio_shape
-                ), "coordinate shape is not consistent with fois shape"
-                assert (
-                    coord.shape[-1] == hyper_para.dims
-                ), "coordinate dimension is not consistent with dims in yaml file"
-            else:
-                Warning(
-                    "No coordinate data is provided, using cartisian coordinate inferred from fois data"
-                )
-                coord = [np.linspace(0, 1, i) for i in self.spatio_shape]
-                coord = np.stack(np.meshgrid(*coord, indexing="ij"), axis=-1)
-                
-            self.train_coord = torch.tensor(coord, dtype=torch.float32)
-            ###### convert to tensor ######
-            fois = (
-                torch.tensor(fois, dtype=torch.float32)
-                if not isinstance(fois, torch.Tensor)
-                else fois
-            )
-            self.N_samples = fois.shape[0] if not extra_siren_in_flag else fois.shape[0] * fois.shape[1]
-            print(f"total training samples: {self.N_samples}")
-            coord = (
-                torch.tensor(coord, dtype=torch.float32)
-                if not isinstance(coord, torch.Tensor)
-                else coord
-            )
+    def _load_data(self, hyper_para):
+        '''Load and preprocess training data.'''
+        # Load field data (fois)
+        fois = self._load_field_data(hyper_para)
+        self._validate_data_shape(fois, hyper_para)
+        
+        # Reshape the data according to batch shape
+        fois = rearrange(fois, f"{hyper_para.readin_data_shape} -> {hyper_para.batch_shape}")
+        self._validate_output_features(fois, hyper_para)
+        
+        # Load or create extra siren input if specified
+        extra_siren_in, extra_siren_in_flag = self._setup_extra_siren_input(hyper_para)
+        
+        # Setup spatial dimensions
+        self._setup_spatial_dimensions(fois, extra_siren_in_flag)
+        
+        # Load coordinate data
+        coord = self._load_coordinate_data(hyper_para)
 
-        ###### normalizer ######
-        self.in_normalizer = Normalizer_ts(**hyper_para.normalizer)
-        self.out_normalizer = Normalizer_ts(**hyper_para.normalizer)
+        # Convert data to tensors if needed
+        fois, coord = self._convert_to_tensors(fois, coord)
+        
+        # Store number of samples
+        self.N_samples = fois.shape[0] if not extra_siren_in_flag else fois.shape[0] * fois.shape[1]
+        print(f"total training samples: {self.N_samples}")
+        
+        # Store data for dataset creation later
+        self.fois = fois
+        self.coord = coord
+        self.extra_siren_in = extra_siren_in
+        self.extra_siren_in_flag = extra_siren_in_flag
+
+    def _load_field_data(self, hyper_para):
+        '''Load the field data based on the configuration.'''
+        if hasattr(hyper_para, "load_data_fn"):
+            if type(hyper_para.load_data_fn) == str:
+                load_data_fn = getattr(readdata, hyper_para.load_data_fn)
+                load_params = {}
+            elif type(hyper_para.load_data_fn) == dict:
+                load_data_fn = getattr(readdata, hyper_para.load_data_fn["name"])
+                load_params = hyper_para.load_data_fn["kwargs"]
+            fois = load_data_fn(**load_params)
+        else:
+            raise NotImplementedError("load_data_fn must be provided.")
+        return fois
+
+    def _validate_data_shape(self, fois, hyper_para):
+        '''Validate that the data shape matches the expected shape.'''
+        assert (rearrange(fois, f"{hyper_para.readin_data_shape} -> {hyper_para.readin_data_shape}") == fois).all(), \
+            f"data shape is {tuple(fois.shape)}, which is inconsistant with the fois_shape ({hyper_para.readin_data_shape}) specified in yaml file."
+
+    def _validate_output_features(self, fois, hyper_para):
+        '''Validate that the output features match the neural field configuration.'''
+        if "kwargs" in hyper_para.NF:
+            assert (hyper_para.NF["kwargs"]["out_features"] == fois.shape[-1]), \
+                f"NF_out_features is not consistent with fois shape, fion shape is {fois.shape}"
+        else:
+            assert (hyper_para.NF["out_features"] == fois.shape[-1]), \
+                f"NF_out_features is not consistent with fois shape, fion shape is {fois.shape}"
+
+    def _setup_extra_siren_input(self, hyper_para):
+        '''Setup extra siren input if specified in the configuration.'''
         if hasattr(hyper_para, "extra_siren_in"):
-            self.extra_in_normalizer = Normalizer_ts(**hyper_para.normalizer)
+            assert isinstance(hyper_para.extra_siren_in, int) or len(hyper_para.extra_siren_in) >= 3
+            if isinstance(hyper_para.extra_siren_in, int):
+                extra_siren_in = torch.linspace(0, 1, hyper_para.extra_siren_in)
+            elif len(hyper_para.extra_siren_in) == 3:
+                extra_siren_in = torch.linspace(*hyper_para.extra_siren_in)
+            elif len(hyper_para.extra_siren_in) > 3:
+                extra_siren_in = torch.tensor(hyper_para.extra_siren_in)
             extra_siren_in_flag = True
         else:
+            extra_siren_in = None
             extra_siren_in_flag = False
-            
-        if not exists(f"{hyper_para.save_path}") and (not infer_mode):
-            mkdir(hyper_para.save_path)
-            
-        if exists(f"{hyper_para.save_path}/normalizer_params.pt"):
-            print(
-                f"loading normalizer parameters from {hyper_para.save_path}/normalizer_params.pt"
+        return extra_siren_in, extra_siren_in_flag
+
+    def _setup_spatial_dimensions(self, fois, extra_siren_in_flag):
+        '''Setup spatial dimensions based on the data.'''
+        self.spatio_shape = fois.shape[1:-1]
+        self.spatio_axis = list(
+            range(fois.ndim if isinstance(fois, np.ndarray) else fois.dim())
+        )[1:-1]
+        if extra_siren_in_flag: 
+            self.spatio_shape = self.spatio_shape[1:]
+            self.spatio_axis = self.spatio_axis[:-1]
+
+    def _load_coordinate_data(self, hyper_para):
+        '''Load coordinate data based on configuration.'''
+        if hasattr(hyper_para, "coor_path"):
+            coord = np.load(f"{hyper_para.coor_path}")
+            assert (coord.shape[:-1] == self.spatio_shape), \
+                "coordinate shape is not consistent with fois shape"
+            assert (coord.shape[-1] == hyper_para.dims), \
+                "coordinate dimension is not consistent with dims in yaml file"
+        elif hasattr(hyper_para, "load_coord_fn"):
+            if type(hyper_para.load_coord_fn) == str:
+                load_coord_fn = getattr(readdata, hyper_para.load_coord_fn)
+                load_params = {}
+            elif type(hyper_para.load_coord_fn) == dict:
+                load_coord_fn = getattr(readdata, hyper_para.load_coord_fn["name"])
+                load_params = hyper_para.load_coord_fn["kwargs"]
+            coord = load_coord_fn(**load_params)
+            if type(coord) == tuple:
+                assert (coord[0].shape[-1] == hyper_para.dims), \
+                    "coordinate dimension is not consistent with dims in yaml file"
+            else:
+                Warning(f"coordinate dimension is not consistent with dims in yaml file {coord.shape[-1]} != {hyper_para.dims}")
+        else:
+            Warning("No coordinate data is provided, using cartisian coordinate inferred from fois data")
+            coord = [np.linspace(0, 1, i)[...,None] for i in self.spatio_shape]
+            print(f"coord shape is {coord[0].shape}")
+            if hyper_para.NF["name"].startswith("Sep") == False:
+                coord = np.stack(np.meshgrid(*coord, indexing="ij"), axis=-1) 
+        return coord
+
+    def _convert_to_tensors(self, fois, coord):
+        '''Convert numpy arrays to PyTorch tensors if needed.'''
+        fois = torch.tensor(fois, dtype=torch.float32) if not isinstance(fois, torch.Tensor) else fois
+        
+        if type(coord) == tuple or type(coord) == list:
+            print("coord is tuple or list")
+            coord = tuple(
+                torch.tensor(i, dtype=torch.float32) if not isinstance(i, torch.Tensor) else i
+                for i in coord
             )
-            norm_params = torch.load(f"{hyper_para.save_path}/normalizer_params.pt")
+        else:
+            coord = torch.tensor(coord, dtype=torch.float32) if not isinstance(coord, torch.Tensor) else coord
+        return fois, coord
+
+    def _setup_normalizers(self, hyper_para):
+        '''Setup data normalizers for inputs and outputs.'''
+        # Create normalizers
+        self.in_normalizer = Normalizer_ts(**hyper_para.normalizer)
+        self.out_normalizer = Normalizer_ts(**hyper_para.normalizer)
+        
+        if hasattr(self, "extra_siren_in_flag") and self.extra_siren_in_flag:
+            self.extra_in_normalizer = Normalizer_ts(**hyper_para.normalizer)
+        
+        # Load or fit normalizer parameters
+        self._load_or_fit_normalizers(hyper_para)
+        
+        # Normalize data if not in inference mode
+        if hasattr(self, "coord") and hasattr(self, "fois"):
+            self._normalize_data()
+
+    def _load_or_fit_normalizers(self, hyper_para):
+        '''Load normalizer parameters if available, otherwise fit them.'''
+        if exists(f"{self.loading_path}/normalizer_params.pt"):
+            print(f"loading normalizer parameters from {self.loading_path}/normalizer_params.pt")
+            norm_params = torch.load(f"{self.loading_path}/normalizer_params.pt")
             self.in_normalizer.params = norm_params["x_normalizer_params"]
             self.out_normalizer.params = norm_params["y_normalizer_params"]
-            if extra_siren_in_flag:
+            if hasattr(self, "extra_siren_in_flag") and self.extra_siren_in_flag:
                 self.extra_in_normalizer.params = norm_params["extra_normalizer_params"]
-
-        elif not infer_mode:
-            print("No noramlization file found! Calculating normalizer parameters")
-            self.in_normalizer.fit_normalize(
-                coord if hyper_para.lumped_latent else coord.flatten(0, hyper_para.dims-1) 
-            )
-            if extra_siren_in_flag:
-                self.out_normalizer.fit_normalize(fois.flatten(0, hyper_para.dims+1))
-            else:
-                self.out_normalizer.fit_normalize(
-                    fois if hyper_para.lumped_latent else fois.flatten(0, hyper_para.dims)
-                )
-            if extra_siren_in_flag:
-                self.extra_in_normalizer.fit_normalize(extra_siren_in.flatten())
-            print(
-                f"Saving normalizer parameters to {hyper_para.save_path}/normalizer_params.pt"
-            )
-            toSave = {
-                "x_normalizer_params": self.in_normalizer.get_params(),
-                "y_normalizer_params": self.out_normalizer.get_params(),
-            }
-            if extra_siren_in_flag:
-                toSave["extra_normalizer_params"] = self.extra_in_normalizer.get_params()
-            torch.save(toSave, hyper_para.save_path + "/normalizer_params.pt",)
         else:
-            raise FileNotFoundError(
-                f"{hyper_para.save_path}/normalizer_params.pt does not exist"
+            self._fit_normalizers(hyper_para)
+
+    def _fit_normalizers(self, hyper_para):
+        '''Fit normalizers to the data and save parameters.'''
+        if type(self.coord) == tuple:
+            print("coord is tuple: Using seperable framework")
+            flat_coord = torch.cat([t.reshape(-1) for t in self.coord])
+            self.in_normalizer.fit_normalize(flat_coord.flatten(0, hyper_para.dims-1))
+        else:
+            self.in_normalizer.fit_normalize(self.coord.flatten(0, hyper_para.dims-1))
+        print("No noramlization file found! Calculating normalizer parameters")
+
+        if hasattr(self, "extra_siren_in_flag") and self.extra_siren_in_flag:
+            self.out_normalizer.fit_normalize(self.fois.flatten(0, hyper_para.dims+1))
+            self.extra_in_normalizer.fit_normalize(self.extra_siren_in.flatten())
+        else:
+            self.out_normalizer.fit_normalize(self.fois.flatten(0, hyper_para.dims))
+        
+        print(f"Saving normalizer parameters to {hyper_para.save_path}/normalizer_params.pt")
+        toSave = {
+            "x_normalizer_params": self.in_normalizer.get_params(),
+            "y_normalizer_params": self.out_normalizer.get_params(),
+        }
+        
+        if hasattr(self, "extra_siren_in_flag") and self.extra_siren_in_flag:
+            toSave["extra_normalizer_params"] = self.extra_in_normalizer.get_params()
+        
+        torch.save(toSave, hyper_para.save_path + "/normalizer_params.pt")
+
+    def _normalize_data(self):
+        '''Normalize the data using the fitted normalizers.'''
+        if type(self.coord) == tuple or type(self.coord) == list:
+            self.normed_coords = tuple(self.in_normalizer.normalize(i) for i in self.coord)
+        else:
+            self.normed_coords = self.in_normalizer.normalize(self.coord)
+        
+        self.normed_fois = self.out_normalizer.normalize(self.fois)
+        
+        if hasattr(self, "extra_siren_in_flag") and self.extra_siren_in_flag:
+            self.normed_extra_siren_in = self.extra_in_normalizer.normalize(self.extra_siren_in)
+        else:
+            self.normed_extra_siren_in = None
+
+    def _init_network(self, hyper_para):
+        '''Initialize the neural field network and related components.'''
+        # Initialize neural field
+        self._init_neural_field(hyper_para)
+        
+        # Initialize latents if not in inference mode
+        self.latents = LatentContainer(
+                self.N_samples, hyper_para.hidden_size, hyper_para.dims
             )
+        # Initialize dataset if not in inference mode
+        self._init_dataset(hyper_para)
 
-        if not infer_mode:
-            normed_coords = self.in_normalizer.normalize(coord)
-            normed_fois = self.out_normalizer.normalize(fois)
-            if extra_siren_in_flag:
-                normed_extra_siren_in = self.extra_in_normalizer.normalize(extra_siren_in)
-            else:
-                normed_extra_siren_in = None
-
-
-        ###### nf ######
+    def _init_neural_field(self, hyper_para):
+        '''Initialize the neural field network.'''
         if "kwargs" not in hyper_para.NF:
-            self.nf: torch.nn.Module = getattr(nf_networks, hyper_para.NF["name"])(
-                in_coord_features=hyper_para.dims if not extra_siren_in_flag else hyper_para.dims+1,
-                in_latent_features=hyper_para.hidden_size,
-                out_features=hyper_para.NF["out_features"],
-                num_hidden_layers=hyper_para.NF["num_hidden_layers"],
-                hidden_features=hyper_para.NF["hidden_features"],
-            )
+            raise NotImplementedError("kwargs must be provided in config file!!!")
         else:
-            self.nf: torch.nn.Module = getattr(nf_networks, hyper_para.NF["name"])(
-                hyper_para.NF["kwargs"]
+            self.nf = getattr(nf_networks, hyper_para.NF["name"])(
+                **hyper_para.NF["kwargs"]
             )
 
-        ###### latents ######
-        if not infer_mode:
-            self.latents = LatentContainer(
-                self.N_samples, hyper_para.hidden_size, hyper_para.dims, hyper_para.lumped_latent
-            )
+    def _init_dataset(self, hyper_para):
+        '''Initialize the dataset for training.'''
+        if hasattr(hyper_para, "dataset"):
+            raise NotImplementedError
+        else:
+            self.dataset = basic_set(self.normed_fois, self.normed_coords, self.normed_extra_siren_in)
+        
+        self.test_criteria = partial(
+            getattr(sys.modules[__name__], hyper_para.test_criteria),
+        )
 
-        self.hyper_para = hyper_para
+    def _setup_visualization(self, hyper_para):
+        '''Setup visualization functions if specified.'''
+        if hasattr(hyper_para, "plotting_func"):
+            self.plotter = getattr(visualize_tools, hyper_para.plotting_func)
+        else:
+            self.plotter = None
 
-        if not infer_mode:
-            if hasattr(hyper_para, "dataset"):
-                raise NotImplementedError
-
-            else:
-                self.dataset = basic_set(normed_fois, normed_coords, normed_extra_siren_in)
-
-            self.test_criteria = partial(
-                getattr(sys.modules[__name__], hyper_para.test_criteria),
-                dims=self.spatio_axis,
-            )
-
-        if infer_mode and not infer_dps:
-            self.infer = torch.no_grad(self.infer)
+    def _load_obstacle_mask(self, hyper_para):
+        '''Load observation mask if specified.'''
+        if hasattr(hyper_para, "load_mask_fn"):
+            print("Loading observation mask")
+            if type(hyper_para.load_mask_fn) == str:
+                load_mask_fn = getattr(readdata, hyper_para.load_mask_fn)
+                load_params = {}
+            elif type(hyper_para.load_mask_fn) == dict:
+                load_mask_fn = getattr(readdata, hyper_para.load_mask_fn["name"])
+                load_params = hyper_para.load_mask_fn["kwargs"]
+            self.obs_mask = load_mask_fn(**load_params)
+        else:
+            print("No observation mask provided")
+            self.obs_mask = None
 
     def infer(
         self,
@@ -379,6 +478,23 @@ class trainer(object):
 
         if rank == 0:
             logger = SummaryWriter(hyper_para.save_path)
+            '''
+            Alternative logger neptune usage as follows 
+
+            run =  neptune.init_run(
+                project="JX-Group/Sep-CNF",
+                api_token="",
+                tags=[],
+                # mode="debug",  # "debug" or "async"
+                )  # your credentials
+                    
+            run["config"] = hyper_para.yaml_dict
+            ID = run["sys/id"].fetch()
+            # to log loss at each epoch just run["keys"].append(loss.item())
+            # to log figures also use run["fig/key"].append(fig) 
+            # where fig is the matplotlib figure object
+
+            '''
 
         optim_net_dec = torch.optim.Adam(model.parameters(), lr=hyper_para.lr["nf"])
         optim_states = torch.optim.Adam(

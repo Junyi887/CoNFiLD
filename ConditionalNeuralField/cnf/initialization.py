@@ -114,6 +114,11 @@ def init_weights_xavier(m):
         nn.init.xavier_normal_(m.weight)
 
 
+def sine_init_wrapper(w0 = DEFAULT_W0):
+    def init(m):
+        sine_init(m, w0)
+    return init 
+
 def sine_init(m, w0 = DEFAULT_W0):
     with torch.no_grad():
         if hasattr(m, 'weight'):
@@ -123,7 +128,7 @@ def sine_init(m, w0 = DEFAULT_W0):
                 -math.sqrt(6 / num_input) / w0, 
                 math.sqrt(6 / num_input) / w0
             )
-
+            
 def first_layer_sine_init(m):
     with torch.no_grad():
         if hasattr(m, 'weight'):
